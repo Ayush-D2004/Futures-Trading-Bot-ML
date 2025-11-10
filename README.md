@@ -9,7 +9,6 @@ Advanced cryptocurrency trading bot with LightGBM ML model, real-time data pipel
 - **Feature Engineering**: 23 technical indicators with deterministic computation
 - **LightGBM Model**: Fast regression model predicting 5-minute forward returns
 - **Automated Retraining**: 15-minute cadence with drift detection (PSI) and performance monitoring
-- **Shadow Mode**: Safe model deployment with validation before activation
 - **Risk Management**: Stop-loss (2%), take-profit (5%), peak PnL drawdown (20%), daily limits
 - **Execution Engine**: Paper trading or live execution modes
 - **Monitoring**: Metrics logging, PSI tracking, trade logging to Parquet
