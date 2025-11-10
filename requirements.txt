@@ -1,0 +1,27 @@
+# Core ML & Data
+numpy
+pandas
+lightgbm
+scikit-learn
+
+# Binance API & WebSocket
+python-binance
+websockets
+aiohttp
+
+# Data Storage
+pyarrow
+fastparquet
+
+# Configuration & Validation
+pydantic
+pyyaml
+
+# Scheduling
+apscheduler
+
+# Monitoring & Logging
+structlog
+
+# Utilities
+python-dotenv
