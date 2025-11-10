@@ -13,7 +13,7 @@ Advanced cryptocurrency trading bot with LightGBM ML model, real-time data pipel
 - **Risk Management**: Stop-loss (2%), take-profit (5%), peak PnL drawdown (20%), daily limits
 - **Execution Engine**: Paper trading or live execution modes
 - **Monitoring**: Metrics logging, PSI tracking, trade logging to Parquet
-
+<!-- 
 ## 📁 Project Structure
 
 ```
@@ -33,7 +33,7 @@ Quant Bot/
 ├── requirements.txt        # Python dependencies
 ├── .env.example            # Environment variables template
 └── README.md               # This file
-```
+``` -->
 
 ## 🚀 Quick Start
 
