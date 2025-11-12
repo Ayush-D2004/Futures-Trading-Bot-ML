@@ -13,6 +13,11 @@ The bot uses **LightGBM regression** to predict 10-minute forward returns along 
 - **Exit**: Closes position on signal reversal (4.5 bps), stop-loss (1%), or take-profit (3%)
 - **Cooldown**: 3-minute wait between trades.
 
+---
+
+## 🏗️ System Architecture
+
+![System Architecture](architecture.png)
 
 ---
 
