@@ -1,10 +1,14 @@
 """
-Feature engineering service for training and live predictions.
-Ensures deterministic feature computation between training and serving.
+Simplified feature engineering service using only essential technical indicators:
+- EMA (12, 26 periods)
+- RSI (14 period)
+- VWAP (Volume Weighted Average Price)
+- Spread (high-low range)
+- Price/Volume momentum
 """
 import pandas as pd
 import numpy as np
-from typing import Tuple, Dict, List
+from typing import Tuple, List
 import json
 from pathlib import Path
 
@@ -14,30 +18,29 @@ from src.utils import get_logger, ensure_dir
 
 class FeatureService:
     """
-    Computes features for both training (1m bars) and execution (1s micro-features).
-    Feature computation must be identical between training and serving to avoid leakage.
+    Simplified feature service using only essential technical indicators.
     """
     
     def __init__(self, config: Config):
         self.config = config
         self.logger = get_logger("feature_service")
         
-        # Feature configuration
-        self.rolling_windows = config.features.rolling_windows
-        self.ema_periods = config.features.ema_periods
-        self.rsi_period = config.features.rsi_period
-        self.volatility_window = config.features.volatility_window
+        # Simplified feature configuration
+        self.ema_fast = 12
+        self.ema_slow = 26
+        self.rsi_period = 14
+        self.vwap_period = 60  # 1 hour rolling VWAP
         
         self.feature_spec = self._build_feature_spec()
     
     def _build_feature_spec(self) -> dict:
-        """Build feature specification for reproducibility."""
+        """Build feature specification."""
         return {
-            'rolling_windows': self.rolling_windows,
-            'ema_periods': self.ema_periods,
+            'ema_fast': self.ema_fast,
+            'ema_slow': self.ema_slow,
             'rsi_period': self.rsi_period,
-            'volatility_window': self.volatility_window,
-            'version': '1.0'
+            'vwap_period': self.vwap_period,
+            'version': '2.0'
         }
     
     def save_feature_spec(self, path: str):
@@ -47,100 +50,73 @@ class FeatureService:
             json.dump(self.feature_spec, f, indent=2)
         self.logger.info("feature_spec_saved", path=path)
     
-    def _compute_log_returns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute log returns."""
-        df = df.copy()
-        df['log_ret_1m'] = np.log(df['close'] / df['close'].shift(1))
-        return df
+    def _compute_ema(self, series: pd.Series, period: int) -> pd.Series:
+        """Compute Exponential Moving Average."""
+        return series.ewm(span=period, adjust=False).mean()
     
-    def _compute_rolling_returns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute rolling returns over multiple windows."""
-        df = df.copy()
+    def _compute_rsi(self, series: pd.Series, period: int = 14) -> pd.Series:
+        """Compute Relative Strength Index."""
+        delta = series.diff()
         
-        for window in self.rolling_windows:
-            df[f'ret_{window}m'] = df['log_ret_1m'].rolling(window).sum()
+        gain = delta.where(delta > 0, 0).rolling(window=period).mean()
+        loss = -delta.where(delta < 0, 0).rolling(window=period).mean()
         
-        return df
-    
-    def _compute_ema_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute EMA-based features."""
-        df = df.copy()
-        
-        for period in self.ema_periods:
-            df[f'ema_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
-        
-        # EMA differences
-        if len(self.ema_periods) >= 2:
-            df['ema_diff_12_26'] = df['ema_12'] - df['ema_26']
-            df['ema_diff_12_60'] = df['ema_12'] - df['ema_60']
-        
-        return df
-    
-    def _compute_rsi(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
-        """Compute RSI indicator."""
-        delta = df['close'].diff()
-        
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        
-        rs = gain / loss
+        rs = gain / (loss + 1e-10)  # Avoid division by zero
         rsi = 100 - (100 / (1 + rs))
         
         return rsi
     
-    def _compute_volatility(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute realized volatility."""
-        df = df.copy()
-        df['volatility'] = df['log_ret_1m'].rolling(self.volatility_window).std()
-        return df
+    def _compute_vwap(self, df: pd.DataFrame, period: int) -> pd.Series:
+        """Compute Volume Weighted Average Price."""
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        vwap = (typical_price * df['volume']).rolling(period).sum() / df['volume'].rolling(period).sum()
+        return vwap
     
-    def _compute_volume_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute volume-based features."""
+    def _compute_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Compute all features from 1-minute OHLCV data."""
         df = df.copy()
+        df = df.sort_values('timestamp').reset_index(drop=True)
         
-        # Volume rolling mean
-        df['volume_ma_5'] = df['volume'].rolling(5).mean()
+        # 1. EMAs
+        df['ema_12'] = self._compute_ema(df['close'], self.ema_fast)
+        df['ema_26'] = self._compute_ema(df['close'], self.ema_slow)
+        df['ema_diff'] = df['ema_12'] - df['ema_26']
+        df['ema_diff_pct'] = (df['ema_12'] / df['ema_26'] - 1) * 100
+        
+        # 2. RSI
+        df['rsi'] = self._compute_rsi(df['close'], self.rsi_period)
+        df['rsi_normalized'] = (df['rsi'] - 50) / 50  # Normalize to [-1, 1]
+        
+        # 3. VWAP
+        df['vwap'] = self._compute_vwap(df, self.vwap_period)
+        df['price_to_vwap'] = (df['close'] / df['vwap'] - 1) * 100
+        
+        # 4. Spread (high-low range)
+        df['spread'] = (df['high'] - df['low']) / df['close'] * 100
+        df['spread_ma'] = df['spread'].rolling(15).mean()
+        
+        # 5. Returns (multiple windows)
+        df['ret_1m'] = df['close'].pct_change(1) * 100
+        df['ret_5m'] = df['close'].pct_change(5) * 100
+        df['ret_15m'] = df['close'].pct_change(15) * 100
+        
+        # 6. Volume momentum
         df['volume_ma_15'] = df['volume'].rolling(15).mean()
+        df['volume_ratio'] = df['volume'] / (df['volume_ma_15'] + 1e-10)
         
-        # Volume ratio
-        df['volume_ratio'] = df['volume'] / df['volume_ma_15']
+        # 7. Price momentum (distance from MA)
+        df['price_ma_15'] = df['close'].rolling(15).mean()
+        df['price_to_ma'] = (df['close'] / df['price_ma_15'] - 1) * 100
         
-        return df
-    
-    def _compute_price_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute price-based features."""
-        df = df.copy()
+        # 8. Volatility (std of returns) - key for volatile periods
+        df['volatility_15m'] = df['close'].pct_change().rolling(15).std() * 100
+        df['volatility_60m'] = df['close'].pct_change().rolling(60).std() * 100
         
-        # High-Low spread
-        df['hl_spread'] = (df['high'] - df['low']) / df['close']
+        # 9. Price acceleration (rate of change of returns)
+        df['acceleration'] = df['ret_1m'].diff()
         
-        # Close position in range
-        df['close_position'] = (df['close'] - df['low']) / (df['high'] - df['low'])
-        df['close_position'] = df['close_position'].fillna(0.5)
-        
-        return df
-    
-    def _compute_drawdown(self, df: pd.DataFrame, window: int = 60) -> pd.DataFrame:
-        """Compute rolling drawdown."""
-        df = df.copy()
-        rolling_max = df['close'].rolling(window).max()
-        df['drawdown'] = (df['close'] / rolling_max) - 1
-        return df
-    
-    def _compute_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute time-based cyclical features."""
-        df = df.copy()
-        
-        df['hour'] = df['timestamp'].dt.hour
-        df['minute'] = df['timestamp'].dt.minute
-        
-        # Cyclical encoding
-        df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
-        df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
-        df['minute_sin'] = np.sin(2 * np.pi * df['minute'] / 60)
-        df['minute_cos'] = np.cos(2 * np.pi * df['minute'] / 60)
-        
-        df = df.drop(['hour', 'minute'], axis=1)
+        # 10. Volume-price divergence (volume increasing while price falling = potential reversal)
+        df['volume_price_div'] = (df['volume_ratio'] - 1) * (df['ret_5m'])
         
         return df
     
@@ -158,54 +134,48 @@ class FeatureService:
         if df_1m.empty:
             return pd.DataFrame(), pd.Series()
         
-        df = df_1m.copy()
-        df = df.sort_values('timestamp').reset_index(drop=True)
+        df = self._compute_features(df_1m)
         
-        # Price features
-        df = self._compute_log_returns(df)
-        df = self._compute_rolling_returns(df)
-        df = self._compute_ema_features(df)
-        df['rsi'] = self._compute_rsi(df, self.rsi_period)
-        df = self._compute_volatility(df)
-        df = self._compute_drawdown(df)
-        df = self._compute_volume_features(df)
-        df = self._compute_price_features(df)
-        df = self._compute_time_features(df)
-        
-        # Target: 5-minute forward return (strict forward indexing)
+        # Target: 5-minute forward return
         horizon = self.config.training.prediction_horizon_minutes
-        df['target_5m'] = (df['close'].shift(-horizon) / df['close']) - 1
+        df['target'] = (df['close'].shift(-horizon) / df['close'] - 1) * 100
         
         # Remove rows with NaN in target
-        df = df.dropna(subset=['target_5m'])
+        df = df.dropna(subset=['target'])
         
-        # Feature columns (exclude metadata and target)
-        exclude_cols = ['timestamp', 'symbol', 'open', 'high', 'low', 'close', 
-                       'volume', 'num_trades', 'target_5m']
-        feature_cols = [col for col in df.columns if col not in exclude_cols]
+        # Feature columns (19 features now, added volatility & momentum)
+        feature_cols = [
+            'ema_12', 'ema_26', 'ema_diff', 'ema_diff_pct',
+            'rsi', 'rsi_normalized',
+            'vwap', 'price_to_vwap',
+            'spread', 'spread_ma',
+            'ret_1m', 'ret_5m', 'ret_15m',
+            'volume_ratio', 'price_to_ma',
+            'volatility_15m', 'volatility_60m',  # NEW: volatility features
+            'acceleration', 'volume_price_div'   # NEW: momentum features
+        ]
         
-        # Drop rows with NaN in features
-        df = df.dropna(subset=feature_cols)
+        # Fill NaN values (forward fill -> backward fill -> zeros)
+        df[feature_cols] = df[feature_cols].ffill().bfill().fillna(0)
         
         X = df[feature_cols]
-        y = df['target_5m']
+        y = df['target']
         
-        self.logger.debug(
+        self.logger.info(
             "train_features_computed",
             num_samples=len(X),
-            num_features=len(feature_cols),
-            features=feature_cols
+            num_features=len(feature_cols)
         )
         
         return X, y
     
-    def compute_live_features(self, df_1m: pd.DataFrame, df_1s_recent: pd.DataFrame = None) -> pd.DataFrame:
+    def compute_live_features(self, df_1m: pd.DataFrame) -> pd.DataFrame:
         """
         Compute features for live prediction (no target).
+        Uses EXACT same features as training.
         
         Args:
             df_1m: Historical 1-minute bars
-            df_1s_recent: Recent 1-second bars for micro-features (optional for MVP)
             
         Returns:
             X_live: Feature matrix for latest timestamp
@@ -213,30 +183,21 @@ class FeatureService:
         if df_1m.empty:
             return pd.DataFrame()
         
-        df = df_1m.copy()
-        df = df.sort_values('timestamp').reset_index(drop=True)
+        df = self._compute_features(df_1m)
         
-        # Compute same features as training
-        df = self._compute_log_returns(df)
-        df = self._compute_rolling_returns(df)
-        df = self._compute_ema_features(df)
-        df['rsi'] = self._compute_rsi(df, self.rsi_period)
-        df = self._compute_volatility(df)
-        df = self._compute_drawdown(df)
-        df = self._compute_volume_features(df)
-        df = self._compute_price_features(df)
-        df = self._compute_time_features(df)
+        # Feature columns (MUST match training features - 19 features)
+        feature_cols = [
+            'ema_12', 'ema_26', 'ema_diff', 'ema_diff_pct',
+            'rsi', 'rsi_normalized',
+            'vwap', 'price_to_vwap',
+            'spread', 'spread_ma',
+            'ret_1m', 'ret_5m', 'ret_15m',
+            'volume_ratio', 'price_to_ma',
+            'volatility_15m', 'volatility_60m',  
+            'acceleration', 'volume_price_div'   
+        ]
         
-        # Micro-features from 1s data (optional)
-        if df_1s_recent is not None and not df_1s_recent.empty:
-            df = self._compute_micro_features(df, df_1s_recent)
-        
-        # Feature columns
-        exclude_cols = ['timestamp', 'symbol', 'open', 'high', 'low', 'close', 
-                       'volume', 'num_trades']
-        feature_cols = [col for col in df.columns if col not in exclude_cols]
-        
-        # Get latest row
+        # Get latest row with valid features
         df = df.dropna(subset=feature_cols)
         
         if df.empty:
@@ -246,46 +207,15 @@ class FeatureService:
         
         return X_live
     
-    def _compute_micro_features(self, df_1m: pd.DataFrame, df_1s: pd.DataFrame) -> pd.DataFrame:
-        """
-        Compute execution micro-features from 1-second data.
-        (Placeholder for future orderbook features)
-        """
-        df = df_1m.copy()
-        
-        if df_1s.empty:
-            return df
-        
-        # Recent volume spike
-        recent_volume = df_1s['volume'].tail(10).sum()
-        median_volume = df_1s['volume'].median()
-        
-        df['volume_spike'] = recent_volume / median_volume if median_volume > 0 else 1.0
-        
-        # Short-term price slope (last 10 seconds)
-        if len(df_1s) >= 10:
-            recent_prices = df_1s['close'].tail(10).values
-            x = np.arange(len(recent_prices))
-            slope = np.polyfit(x, recent_prices, 1)[0]
-            df['price_slope_10s'] = slope
-        else:
-            df['price_slope_10s'] = 0.0
-        
-        return df
-    
     def get_feature_names(self) -> List[str]:
-        """Get list of feature names for model training."""
-        # Create dummy dataframe to extract feature names
-        dummy_df = pd.DataFrame({
-            'timestamp': pd.date_range('2024-01-01', periods=100, freq='1min'),
-            'symbol': 'BTCUSDT',
-            'open': 50000.0,
-            'high': 50100.0,
-            'low': 49900.0,
-            'close': 50000.0,
-            'volume': 100.0,
-            'num_trades': 10
-        })
-        
-        X, _ = self.compute_train_features(dummy_df)
-        return list(X.columns)
+        """Get list of feature names (19 features total)."""
+        return [
+            'ema_12', 'ema_26', 'ema_diff', 'ema_diff_pct',
+            'rsi', 'rsi_normalized',
+            'vwap', 'price_to_vwap',
+            'spread', 'spread_ma',
+            'ret_1m', 'ret_5m', 'ret_15m',
+            'volume_ratio', 'price_to_ma',
+            'volatility_15m', 'volatility_60m',
+            'acceleration', 'volume_price_div'
+        ]

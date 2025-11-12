@@ -14,6 +14,7 @@ class DataConfig(BaseModel):
     parquet_roll_minutes: int
     raw_data_dir: str
     processed_data_dir: str
+    prediction_interval_seconds: int = 60  # Default: predict once per minute
 
 
 class BinanceConfig(BaseModel):
@@ -21,6 +22,13 @@ class BinanceConfig(BaseModel):
     mainnet_ws_url: str
     api_key_env: str
     api_secret_env: str
+
+
+class FuturesConfig(BaseModel):
+    enabled: bool
+    leverage: int = Field(ge=1, le=125)  # Binance allows 1-125x
+    margin_type: Literal["CROSSED", "ISOLATED"]
+    position_mode: Literal["ONE_WAY", "HEDGE"]
 
 
 class LightGBMParams(BaseModel):
@@ -96,11 +104,15 @@ class DatabaseConfig(BaseModel):
 class BacktestingConfig(BaseModel):
     initial_capital: float
     results_dir: str
+    train_hours: int = 12
+    test_start_offset_hours: int = 24
+    retrain_interval_minutes: int = 60
 
 
 class Config(BaseModel):
     data: DataConfig
     binance: BinanceConfig
+    futures: FuturesConfig
     training: TrainingConfig
     features: FeaturesConfig
     retraining: RetrainingConfig

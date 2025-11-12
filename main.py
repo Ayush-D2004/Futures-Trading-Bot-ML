@@ -7,11 +7,10 @@ from src.orchestrator import TradingBot
 def main():
     """Run the trading bot."""
     print("=" * 70)
-    print(" " * 15 + "TRC Quant Trading Bot")
+    print(" " * 15 + "Quant Trading Bot")
     print("=" * 70)
     print()
     print("Starting bot with configuration from config.yaml...")
-    print("Press Ctrl+C to stop")
     print()
     
     bot = TradingBot()

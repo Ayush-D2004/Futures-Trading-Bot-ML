@@ -77,15 +77,13 @@ class Predictor:
     
     def predict(
         self, 
-        df_1m: pd.DataFrame,
-        df_1s_recent: pd.DataFrame = None
+        df_1m: pd.DataFrame
     ) -> Optional[Prediction]:
         """
-        Generate prediction for current timestamp.
+        Generate prediction for current timestamp using 1-minute data.
         
         Args:
             df_1m: Historical 1-minute bars
-            df_1s_recent: Recent 1-second bars (optional)
             
         Returns:
             Prediction object or None
@@ -94,8 +92,8 @@ class Predictor:
             self.logger.warning("prediction_skipped_no_model")
             return None
         
-        # Compute features
-        X_live = self.feature_service.compute_live_features(df_1m, df_1s_recent)
+        # Compute features from 1-minute data only
+        X_live = self.feature_service.compute_live_features(df_1m)
         
         if X_live.empty:
             self.logger.warning("prediction_skipped_no_features")

@@ -8,6 +8,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 import signal
 import sys
 from dotenv import load_dotenv
+import pandas as pd
 
 from src.config import load_config
 from src.utils import setup_logging
@@ -36,7 +37,8 @@ class TradingBot:
         # Setup logging
         self.logger = setup_logging(
             log_dir=self.config.monitoring.log_dir,
-            level="INFO"
+            level="INFO",
+            console_level="INFO"  # Show activity on console
         )
         
         self.logger.info("initializing_trading_bot")
@@ -52,7 +54,7 @@ class TradingBot:
         self.monitor = Monitor(self.config)
         
         # Ingestor with callback
-        self.ingestor = BinanceIngestor(self.config, on_tick_callback=self._on_tick)
+        self.ingestor = BinanceIngestor(self.config, on_kline_callback=self._on_kline)
         
         # Scheduler for periodic tasks
         self.scheduler = AsyncIOScheduler()
@@ -67,53 +69,20 @@ class TradingBot:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
     
-    async def _on_tick(self, tick):
-        """Callback for each incoming tick."""
-        # Aggregate tick into bars
-        completed_bars = self.aggregator.add_tick(tick)
+    async def _on_kline(self, bar):
+        """Callback for each completed 1-minute bar."""
+        # Add bar to buffer
+        self.buffer_manager.add_bar_1m(bar)
         
-        # Handle completed 1-second bar
-        if completed_bars['1s']:
-            bar_1s = completed_bars['1s']
-            self.buffer_manager.add_bar_1s({
-                'timestamp': bar_1s.timestamp,
-                'symbol': bar_1s.symbol,
-                'open': bar_1s.open,
-                'high': bar_1s.high,
-                'low': bar_1s.low,
-                'close': bar_1s.close,
-                'volume': bar_1s.volume,
-                'num_trades': bar_1s.num_trades
-            })
-            
-            # Generate prediction every second
-            await self._generate_prediction()
-        
-        # Handle completed 1-minute bar
-        if completed_bars['1m']:
-            bar_1m = completed_bars['1m']
-            self.buffer_manager.add_bar_1m({
-                'timestamp': bar_1m.timestamp,
-                'symbol': bar_1m.symbol,
-                'open': bar_1m.open,
-                'high': bar_1m.high,
-                'low': bar_1m.low,
-                'close': bar_1m.close,
-                'volume': bar_1m.volume,
-                'num_trades': bar_1m.num_trades
-            })
+        # Generate prediction once per minute (when new bar completes)
+        await self._generate_prediction()
     
     async def _generate_prediction(self):
-        """Generate prediction and make trading decision."""
-        # Get data
+        """Generate prediction and make trading decision (once per minute)."""
+        # Get 1-minute data
         df_1m = self.buffer_manager.get_rolling_df(
             self.config.data.symbol,
             freq='1m'
-        )
-        
-        df_1s = self.buffer_manager.get_rolling_df(
-            self.config.data.symbol,
-            freq='1s'
         )
         
         if df_1m.empty:
@@ -122,8 +91,8 @@ class TradingBot:
         # Reload model if updated
         self.predictor.reload_model_if_updated()
         
-        # Generate prediction
-        prediction = self.predictor.predict(df_1m, df_1s.tail(10) if not df_1s.empty else None)
+        # Generate prediction from 1-minute data only
+        prediction = self.predictor.predict(df_1m)
         
         if prediction is None:
             return
@@ -134,63 +103,47 @@ class TradingBot:
             self.logger.info("shadow_prediction", prediction=prediction.predicted_return)
             return
         
-        # Get current price and volatility
+        # Get current price
         current_price = df_1m.iloc[-1]['close']
-        recent_returns = df_1m['close'].pct_change().dropna()
-        volatility = recent_returns.std() if len(recent_returns) > 1 else 0.02
         
-        # Check stop-loss and take-profit on existing position
-        if self.execution_engine.position.quantity != 0:
+        # New Strategy: Hold position, close only on signal reversal or risk controls
+        # Check risk controls on existing position
+        if self.execution_engine.has_position():
+            # Check stop-loss
             if self.execution_engine.check_stop_loss(current_price):
-                # Close position due to stop-loss
-                close_side = OrderSide.SELL if self.execution_engine.position.quantity > 0 else OrderSide.BUY
-                self.execution_engine.submit_order(
-                    side=close_side,
-                    quantity=abs(self.execution_engine.position.quantity),
-                    order_type=OrderType.MARKET
-                )
+                self.execution_engine.close_position(current_price, reason="stop_loss")
                 self.logger.info("position_closed_stop_loss")
                 return
             
+            # Check take-profit
             if self.execution_engine.check_take_profit(current_price):
-                # Close position due to take-profit
-                close_side = OrderSide.SELL if self.execution_engine.position.quantity > 0 else OrderSide.BUY
-                self.execution_engine.submit_order(
-                    side=close_side,
-                    quantity=abs(self.execution_engine.position.quantity),
-                    order_type=OrderType.MARKET
-                )
+                self.execution_engine.close_position(current_price, reason="take_profit")
                 self.logger.info("position_closed_take_profit")
                 return
+            
+            # Check for signal reversal
+            if self.execution_engine.should_reverse_position(prediction.predicted_return):
+                self.execution_engine.close_position(current_price, reason="signal_reversal")
+                self.logger.info("position_closed_signal_reversal",
+                                prediction=prediction.predicted_return)
+                # Don't return - may open opposite position below
         
-        # Make trading decision
-        decision = self.execution_engine.make_decision(
+        # Make trading decision (open new position or hold existing)
+        action = self.execution_engine.decide_action(
             prediction=prediction.predicted_return,
-            current_price=current_price,
-            volatility=volatility
+            current_price=current_price
         )
         
-        if decision:
-            # Execute trade
-            order = self.execution_engine.submit_order(
-                side=decision['side'],
-                quantity=decision['size'],
-                order_type=decision['order_type']
+        if action == "OPEN_LONG" or action == "OPEN_SHORT":
+            # Open new position
+            self.execution_engine.open_position(
+                side="LONG" if action == "OPEN_LONG" else "SHORT",
+                price=current_price,
+                prediction=prediction.predicted_return
             )
-            
-            if order:
-                # Log trade
-                trade_data = {
-                    'timestamp': order.timestamp,
-                    'symbol': order.symbol,
-                    'side': order.side.value,
-                    'quantity': order.quantity,
-                    'price': order.filled_price,
-                    'prediction': prediction.predicted_return,
-                    'model_version': prediction.model_version,
-                    'pnl': 0.0  # Will be updated on exit
-                }
-                self.monitor.log_trade(trade_data)
+            self.logger.info("position_opened",
+                           side=action,
+                           prediction=prediction.predicted_return)
     
     def _import_numpy(self):
         """Import numpy for shadow mode evaluation."""
@@ -201,12 +154,11 @@ class TradingBot:
         """Periodic retraining task."""
         self.logger.info("retrain_task_triggered")
         
-        # Check if we have sufficient data
-        if not self.buffer_manager.has_sufficient_data(
-            min_rows=self.config.training.min_training_rows,
-            freq='1m'
-        ):
-            self.logger.warning("insufficient_data_for_retraining")
+        # Get available 1m bars - NO MINIMUM REQUIRED
+        num_bars = self.buffer_manager.get_bar_count('1m')
+        
+        if num_bars == 0:
+            self.logger.warning("no_data_for_retraining")
             return
         
         # Get training data
@@ -352,10 +304,132 @@ class TradingBot:
         
         self.logger.info("scheduled_tasks_configured")
     
+    async def _fetch_historical_and_train(self):
+        """Fetch historical 1-minute data from Binance and train initial model."""
+        self.logger.info("fetching_historical_data_for_initial_training")
+        
+        from binance.client import Client
+        import os
+        import pandas as pd
+        
+        try:
+            # Initialize Binance client
+            api_key = os.getenv(self.config.binance.api_key_env)
+            api_secret = os.getenv(self.config.binance.api_secret_env)
+            client = Client(api_key, api_secret)
+            
+            # Fetch last 24 hours of 1-minute data (should give us 1440 rows)
+            hours = self.config.data.rolling_window_hours
+            end_time = datetime.now()
+            start_time = end_time - timedelta(hours=hours)
+            
+            self.logger.info(
+                "fetching_klines",
+                symbol=self.config.data.symbol,
+                hours=hours,
+                expected_rows=hours * 60
+            )
+            
+            # Fetch with limit to ensure we get full data
+            klines = client.get_historical_klines(
+                symbol=self.config.data.symbol,
+                interval=Client.KLINE_INTERVAL_1MINUTE,
+                start_str=start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                end_str=end_time.strftime('%Y-%m-%d %H:%M:%S'),
+                limit=1500  # Request extra to ensure full coverage
+            )
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(klines, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+                'taker_buy_quote', 'ignore'
+            ])
+            
+            # Convert types
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df['open'] = df['open'].astype(float)
+            df['high'] = df['high'].astype(float)
+            df['low'] = df['low'].astype(float)
+            df['close'] = df['close'].astype(float)
+            df['volume'] = df['volume'].astype(float)
+            df['trades'] = df['trades'].astype(int)
+            df['symbol'] = self.config.data.symbol
+            
+            # Keep only required columns
+            df = df[['timestamp', 'symbol', 'open', 'high', 'low', 'close', 'volume', 'trades']]
+            df.rename(columns={'trades': 'num_trades'}, inplace=True)
+            
+            # Sort by timestamp
+            df = df.sort_values('timestamp').reset_index(drop=True)
+            
+            # Fill missing timestamps (if any gaps in data)
+            df = self._fill_missing_timestamps(df)
+            
+            # Impute missing values (forward fill, then backward fill)
+            price_cols = ['open', 'high', 'low', 'close']
+            df[price_cols] = df[price_cols].ffill().bfill()
+            df['volume'] = df['volume'].fillna(0.0)
+            df['num_trades'] = df['num_trades'].fillna(0)
+            
+            self.logger.info(
+                "historical_data_fetched",
+                num_bars=len(df),
+                price_range=f"${df['close'].min():.2f} - ${df['close'].max():.2f}",
+                expected_bars=hours * 60,
+                coverage_pct=f"{len(df) / (hours * 60) * 100:.1f}%"
+            )
+            
+            # Store in buffer manager
+            for _, row in df.iterrows():
+                self.buffer_manager.add_bar_1m(row.to_dict())
+            
+            # Train initial model
+            self.logger.info("training_initial_model")
+            model, metadata = self.trainer.train(df)
+            
+            # Register and promote to active
+            version = self.model_registry.register(model, metadata, status="staging")
+            self.model_registry.promote(version, target="active")
+            
+            self.logger.info(
+                "initial_model_trained",
+                version=version,
+                metrics=metadata.get('metrics')
+            )
+            
+        except Exception as e:
+            self.logger.error("initial_training_failed", error=str(e))
+            raise
+    
+    def _fill_missing_timestamps(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Fill missing minute timestamps with forward-filled data."""
+        if df.empty:
+            return df
+        
+        # Create complete minute range
+        start_time = df['timestamp'].min()
+        end_time = df['timestamp'].max()
+        complete_range = pd.date_range(start=start_time, end=end_time, freq='1min')
+        
+        # Create complete dataframe
+        complete_df = pd.DataFrame({'timestamp': complete_range})
+        
+        # Merge with original data
+        df = complete_df.merge(df, on='timestamp', how='left')
+        
+        # Fill symbol
+        df['symbol'] = self.config.data.symbol
+        
+        return df
+
     async def start(self):
         """Start the trading bot."""
         self.logger.info("starting_trading_bot")
         self.running = True
+        
+        # Fetch historical data and train initial model
+        await self._fetch_historical_and_train()
         
         # Setup scheduled tasks
         self._setup_scheduled_tasks()

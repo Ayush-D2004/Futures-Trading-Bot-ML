@@ -52,10 +52,11 @@ class Trainer:
         # Compute features and labels
         X, y = self.feature_service.compute_train_features(df_1m)
         
-        if len(X) < self.config.training.min_training_rows:
-            raise ValueError(
-                f"Insufficient training data: {len(X)} < {self.config.training.min_training_rows}"
-            )
+        # No minimum restriction - train on whatever data we have
+        if len(X) == 0:
+            raise ValueError("No training data after feature engineering")
+        
+        self.logger.info(f"Training with {len(X)} samples (no minimum required)")
         
         # Walk-forward split: last 20% for validation
         val_split = self.config.training.validation_split

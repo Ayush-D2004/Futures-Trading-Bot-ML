@@ -31,11 +31,11 @@ def setup_logging(log_dir: str = "logs", level: str = "INFO", console_level: str
     
     structlog.configure(
         processors=[
-            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S"),
             structlog.stdlib.add_log_level,
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
-            structlog.processors.JSONRenderer()
+            structlog.dev.ConsoleRenderer(colors=False)  # Human-readable format
         ],
         wrapper_class=structlog.stdlib.BoundLogger,
         context_class=dict,

@@ -55,6 +55,12 @@ class ExecutionEngine:
         # Peak PnL tracking for drawdown limit
         self.peak_total_pnl = 0.0
         
+        # Position state: 'FLAT', 'LONG', 'SHORT'
+        self.position_state = 'FLAT'
+        self.entry_price = 0.0
+        self.entry_time = None
+        self.position_size = 0.0
+        
     def make_decision(
         self, 
         prediction: float,
@@ -430,3 +436,129 @@ class ExecutionEngine:
     def get_daily_pnl(self) -> float:
         """Get today's PnL."""
         return self.daily_pnl
+    
+    def has_position(self) -> bool:
+        """Check if currently holding a position."""
+        return self.position_state != 'FLAT'
+    
+    def should_reverse_position(self, prediction: float) -> bool:
+        """
+        Check if position should be closed due to signal reversal.
+        Requires prediction to flip AND exceed threshold to avoid whipsaws.
+        """
+        if self.position_state == 'FLAT':
+            return False
+        
+        # Use half the entry threshold for reversal (more lenient exit)
+        fee_rate = self.config.execution.fee_rate
+        slippage_rate = self.config.execution.slippage_rate
+        min_edge = self.config.execution.min_edge_bps / 10000
+        reversal_threshold = (fee_rate + slippage_rate + min_edge) * 0.5  # 50% of entry threshold
+        
+        # For LONG: reverse if prediction strongly negative
+        if self.position_state == 'LONG' and prediction < -reversal_threshold:
+            self.logger.info("signal_reversal_detected", 
+                           position="LONG", 
+                           prediction=prediction * 100,
+                           threshold=-reversal_threshold * 100)
+            return True
+        
+        # For SHORT: reverse if prediction strongly positive
+        if self.position_state == 'SHORT' and prediction > reversal_threshold:
+            self.logger.info("signal_reversal_detected",
+                           position="SHORT",
+                           prediction=prediction * 100,
+                           threshold=reversal_threshold * 100)
+            return True
+        
+        return False
+    
+    def close_position(self, current_price: float, reason: str = "unknown"):
+        """Close current position and calculate realized PnL."""
+        if self.position_state == 'FLAT':
+            return
+        
+        # Calculate PnL
+        if self.position_state == 'LONG':
+            pnl = (current_price - self.entry_price) * self.position_size
+        else:  # SHORT
+            pnl = (self.entry_price - current_price) * self.position_size
+        
+        # Apply costs
+        trade_value = self.position_size * current_price
+        costs = trade_value * (self.config.execution.fee_rate + self.config.execution.slippage_rate)
+        realized_pnl = pnl - costs
+        
+        # Update tracking
+        self.position.realized_pnl += realized_pnl
+        self.daily_pnl += realized_pnl
+        
+        self.logger.info(
+            "position_closed",
+            side=self.position_state,
+            entry_price=self.entry_price,
+            exit_price=current_price,
+            size=self.position_size,
+            pnl=realized_pnl,
+            reason=reason
+        )
+        
+        # Reset position state
+        self.position_state = 'FLAT'
+        self.position.quantity = 0.0
+        self.entry_price = 0.0
+        self.entry_time = None
+        self.position_size = 0.0
+    
+    def open_position(self, side: str, price: float, prediction: float):
+        """Open a new position (LONG or SHORT)."""
+        # Calculate position size
+        position_value = self.config.execution.base_capital * self.config.execution.position_size_fraction
+        size = position_value / price
+        
+        # Apply costs
+        trade_value = size * price
+        costs = trade_value * (self.config.execution.fee_rate + self.config.execution.slippage_rate)
+        
+        # Update state
+        self.position_state = side
+        self.entry_price = price
+        self.entry_time = datetime.now()
+        self.position_size = size
+        self.position.quantity = size if side == 'LONG' else -size
+        self.position.avg_entry_price = price
+        
+        self.logger.info(
+            "position_opened",
+            side=side,
+            entry_price=price,
+            size=size,
+            prediction=prediction,
+            costs=costs
+        )
+    
+    def decide_action(self, prediction: float, current_price: float) -> str:
+        """
+        Decide what action to take based on prediction.
+        Returns: 'OPEN_LONG', 'OPEN_SHORT', 'HOLD', or 'NONE'
+        """
+        # Cost estimation
+        cost_est = self._estimate_costs(current_price)
+        min_edge = self.config.execution.min_edge_bps / 10000
+        required_edge = cost_est + min_edge
+        
+        # If already in position, hold it (don't exit unless reversal/stop/tp)
+        if self.position_state != 'FLAT':
+            return 'HOLD'
+        
+        # Check if prediction is strong enough
+        if abs(prediction) < required_edge:
+            return 'NONE'
+        
+        # Open new position based on prediction
+        if prediction > required_edge:
+            return 'OPEN_LONG'
+        elif prediction < -required_edge:
+            return 'OPEN_SHORT'
+        
+        return 'NONE'

@@ -103,13 +103,19 @@ class ModelRegistry:
         # Create/update symlink
         target_link = self.staging_link if target == "staging" else self.active_link
         
-        if target_link.exists() or target_link.is_symlink():
-            target_link.unlink()
+        # Remove existing link/directory
+        if target_link.exists():
+            if target_link.is_symlink():
+                target_link.unlink()
+            elif target_link.is_dir():
+                shutil.rmtree(target_link)
+            else:
+                target_link.unlink()
         
         # Create symlink (Windows requires special handling)
         try:
             target_link.symlink_to(model_dir, target_is_directory=True)
-        except OSError:
+        except (OSError, NotImplementedError):
             # Fallback: copy directory if symlink fails on Windows
             shutil.copytree(model_dir, target_link)
         

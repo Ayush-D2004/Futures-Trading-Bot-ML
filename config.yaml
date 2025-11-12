@@ -3,11 +3,12 @@
 # Data Pipeline
 data:
   symbol: "BTCUSDT"
-  rolling_window_hours: 12
+  rolling_window_hours: 72  # 72-hour rolling window for training (more data = better predictions)
   tick_buffer_size: 100000
   parquet_roll_minutes: 60
   raw_data_dir: "data/raw"
   processed_data_dir: "data/processed"
+  prediction_interval_seconds: 60  # Predict once per minute (not every second)
   
 # Binance API (always use live market data)
 binance:
@@ -16,26 +17,36 @@ binance:
   api_key_env: "BINANCE_API_KEY"
   api_secret_env: "BINANCE_API_SECRET"
   
+# Futures Trading Configuration
+futures:
+  enabled: true                    # Enable futures trading (vs spot)
+  leverage: 20                     # Leverage multiplier (1-125x on Binance)
+  margin_type: "CROSSED"           # CROSSED or ISOLATED
+  position_mode: "ONE_WAY"         # ONE_WAY or HEDGE mode
+  
 # Model Training
 training:
   model_type: "lightgbm"
   train_freq_minutes: 15
-  prediction_horizon_minutes: 5
-  min_training_rows: 720  # 12h * 60min
+  prediction_horizon_minutes: 10  # Predict 10 minutes ahead (better quality signals)
+  min_training_rows: 0  
   validation_split: 0.2
   
   # LightGBM hyperparameters
   lightgbm_params:
-    num_leaves: 31
-    max_depth: 5
-    learning_rate: 0.05
-    n_estimators: 500
-    boosting_type: "gbdt"
+    num_leaves: 64              
+    max_depth: 8                
+    learning_rate: 0.03         
+    n_estimators: 1000          
+    boosting_type: "goss"
     objective: "regression"
     metric: "rmse"
     verbosity: -1
     random_state: 42
-    early_stopping_rounds: 50
+    early_stopping_rounds: 100  
+    min_child_samples: 20       
+    subsample: 0.8              
+    colsample_bytree: 0.8       
     
 # Features
 features:
@@ -64,25 +75,25 @@ retraining:
 # Execution & Risk
 execution:
   paper_trading: true
-  order_type: "LIMIT"  # LIMIT or MARKET
-  base_capital: 10000.0
-  position_size_fraction: 0.1
+  order_type: "MARKET"  # LIMIT or MARKET
+  base_capital: 10000.0              # Base capital in USDT
+  position_size_fraction: 0.1        # Use 10% of capital per trade
   target_volatility: 0.02
-  max_position_usd: 5000.0
-  max_daily_drawdown_pct: 3.0
+  max_position_usd: 100000.0         # Max position (with leverage): $100k
+  max_daily_drawdown_pct: 3.0        # Daily loss limit: 3% of capital
   
   # Stop-loss and take-profit
-  stop_loss_pct: 2.0              # Per-trade stop loss: 2%
-  take_profit_pct: 5.0            # Per-trade take profit: 5%
-  peak_pnl_drawdown_pct: 20.0     # Kill switch: 20% drawdown from peak PnL
+  stop_loss_pct: 1.0             
+  take_profit_pct: 3.0            
+  peak_pnl_drawdown_pct: 20.0     
   
   # Cost model
-  fee_rate: 0.0004  # Binance taker fee
-  slippage_rate: 0.001  # 10 bps
+  fee_rate: 0.0002  # Binance maker fee (0.02% for limit orders)
+  slippage_rate: 0.0005  # 5 bps (reduced for limit orders)
   latency_seconds: 1.0
   
   # Decision thresholds
-  min_edge_bps: 50  # minimum 0.5% expected return
+  min_edge_bps: 1
   
 # Monitoring
 monitoring:
@@ -103,4 +114,8 @@ database:
 # Backtesting
 backtesting:
   initial_capital: 10000.0
+  position_size_fraction: 0.5  # Use 50% of capital per trade (risk management)
   results_dir: "backtests"
+  train_hours: 48  # Train on 48 hours of data (increased for better model)
+  test_start_offset_hours: 72  # Start testing 72 hours before current time
+  retrain_interval_minutes: 60  # Retrain every 1 hour in backtest
